@@ -55,3 +55,32 @@ export interface ASTNode {
   children?: ASTNode[]
   groupIndex?: number
 }
+
+/** 保存用例时的完整快照：正则、测试文本、关注步骤与匹配结果 */
+export interface CaseSnapshot {
+  pattern: string
+  testString: string
+  /** 保存时关注（播放停留）的步骤 */
+  currentStep: number
+  result: MatchResult
+}
+
+/** 最近用例列表中的一条记录 */
+export interface SavedCase extends CaseSnapshot {
+  id: string
+  /** 保存时间（毫秒时间戳），列表按此倒序排列 */
+  savedAt: number
+}
+
+/** 最后一次会话指针：指向某条已保存用例 */
+export interface SessionSnapshot {
+  caseId: string
+  savedAt: number
+}
+
+export type CaseMessageType = 'success' | 'error' | 'info'
+
+export interface CaseMessage {
+  type: CaseMessageType
+  text: string
+}

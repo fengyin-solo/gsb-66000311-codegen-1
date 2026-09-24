@@ -8,6 +8,7 @@
     <div class="flex flex-col lg:flex-row gap-4 p-4">
       <div class="lg:w-1/4 space-y-4">
         <RegexEditor />
+        <CaseHistory />
         <TemplateLibrary />
       </div>
 
@@ -58,13 +59,16 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted } from 'vue'
 import { useRegexStore } from './store/regex'
 import RegexEditor from './components/RegexEditor.vue'
 import NfaVisualizer from './components/NfaVisualizer.vue'
 import MatchHighlight from './components/MatchHighlight.vue'
 import TemplateLibrary from './components/TemplateLibrary.vue'
+import CaseHistory from './components/CaseHistory.vue'
 
 const store = useRegexStore()
-onMounted(() => store.execute())
+// 无历史会话可恢复时，按默认正则执行一次匹配，保持首屏有内容
+if (!store.restoreSession()) {
+  store.execute()
+}
 </script>

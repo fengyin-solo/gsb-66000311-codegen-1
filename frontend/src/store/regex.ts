@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import type { NFA, MatchResult, MatchStep, RegexTemplate, ASTNode } from '../types'
+import type { NFA, MatchResult, MatchStep, RegexTemplate, ASTNode, SavedCase, CaseSnapshot, SessionSnapshot, CaseMessage } from '../types'
+import { readJSON, writeJSON, removeKey, CASES_STORAGE_KEY, SESSION_STORAGE_KEY } from '../utils/storage'
 
 const GROUP_COLORS = ['#ef4444', '#f97316', '#eab308', '#22c55e', '#3b82f6', '#8b5cf6', '#ec4899', '#14b8a6']
 
@@ -402,7 +403,279 @@ export const useRegexStore = defineStore('regex', () => {
   const error = ref('')
   const selectedTemplate = ref<string>('')
 
+  // —— 历史用例与会话恢复 ——
+  const cases = ref<SavedCase[]>([])
+  /** 当前打开/正在查看的用例 id；编辑后不再属于任何用例时清空 */
+  const activeCaseId = ref<string | null>(null)
+  /** 操作反馈（保存失败、重复保存、空历史等），由 UI 统一展示 */
+  const message = ref<CaseMessage | null>(null)
+  /** 启动恢复标志：true 表示已尝试过会话恢复 */
+  const hydrated = ref(false)
+
   const groupColors = GROUP_COLORS
+
+  /** 最近用例：按保存时间倒序 */
+  const recentCases = computed(() =>
+    [...cases.value].sort((a, b) => b.savedAt - a.savedAt)
+  )
+
+  let messageTimer: ReturnType<typeof setTimeout> | undefined
+  function flash(type: CaseMessage['type'], text: string) {
+    message.value = { type, text }
+    if (messageTimer) clearTimeout(messageTimer)
+    messageTimer = setTimeout(() => { message.value = null }, 4000)
+  }
+
+  function isValidResult(result: unknown): result is MatchResult {
+    if (!result || typeof result !== 'object') return false
+    const r = result as Record<string, unknown>
+    return typeof r.matched === 'boolean' &&
+      typeof r.matchText === 'string' &&
+      Array.isArray(r.steps) &&
+      typeof r.backtracks === 'number' &&
+      typeof r.totalSteps === 'number' &&
+      typeof r.duration === 'number'
+  }
+
+  function isValidCase(c: unknown): c is SavedCase {
+    if (!c || typeof c !== 'object') return false
+    const s = c as Record<string, unknown>
+    return typeof s.id === 'string' &&
+      typeof s.pattern === 'string' &&
+      typeof s.testString === 'string' &&
+      typeof s.currentStep === 'number' &&
+      typeof s.savedAt === 'number' &&
+      isValidResult(s.result)
+  }
+
+  /** 读取并过滤掉损坏的历史记录，返回有效用例 */
+  function loadCases(): SavedCase[] {
+    const raw = readJSON<unknown>(CASES_STORAGE_KEY)
+    if (!Array.isArray(raw)) return []
+    return raw.filter(isValidCase)
+  }
+
+  function persistCases(next: SavedCase[]): void {
+    writeJSON(CASES_STORAGE_KEY, next)
+  }
+
+  function persistSession(snap: SessionSnapshot): void {
+    writeJSON(SESSION_STORAGE_KEY, snap)
+  }
+
+  function clearSession(): void {
+    removeKey(SESSION_STORAGE_KEY)
+  }
+
+  /** 深拷贝匹配结果，避免快照与运行态共享引用 */
+  function cloneResult(result: MatchResult): MatchResult {
+    return JSON.parse(JSON.stringify(result)) as MatchResult
+  }
+
+  function genId(): string {
+    if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+      return crypto.randomUUID()
+    }
+    return `case-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+  }
+
+  /**
+   * 应用一份快照到工作区：恢复正则、测试文本、关注步骤、
+   * 高亮（matchResult 快照）、统计，并重建 NFA/AST 使可视化一致。
+   */
+  function applySnapshot(snap: CaseSnapshot) {
+    stop()
+    pattern.value = snap.pattern
+    testString.value = snap.testString
+    matchResult.value = cloneResult(snap.result)
+    error.value = ''
+    selectedTemplate.value = ''
+
+    // 重建状态机与语法树；即使快照结果可用，解析失败也不影响高亮恢复
+    try {
+      const built = buildNFA(snap.pattern)
+      nfa.value = computeNFA(built)
+      ast.value = parseAST(snap.pattern)
+    } catch {
+      nfa.value = null
+      ast.value = null
+    }
+
+    const maxStep = Math.max(0, snap.result.steps.length - 1)
+    currentStep.value = Math.min(Math.max(0, snap.currentStep), maxStep)
+  }
+
+  /**
+   * 保存当前正则、测试文本和关注步骤到最近用例。
+   * - 未执行匹配/解析失败时拒绝保存，编辑内容原样保留
+   * - 同一用例（相同正则 + 测试文本）重复保存时更新关注步骤并置顶，不产生重复条目
+   * - 存储写入失败时明确提示，编辑内容原样保留
+   */
+  function saveCase(): void {
+    if (error.value) {
+      flash('error', '当前正则存在解析错误，无法保存')
+      return
+    }
+    if (!matchResult.value) {
+      flash('error', '请先执行匹配再保存用例')
+      return
+    }
+
+    const result = cloneResult(matchResult.value)
+    const maxStep = Math.max(0, result.steps.length - 1)
+    const step = Math.min(Math.max(0, currentStep.value), maxStep)
+    const now = Date.now()
+
+    // 同一用例：正则与测试文本均相同视为重复保存
+    const existing = cases.value.find(
+      c => c.pattern === pattern.value && c.testString === testString.value
+    )
+
+    let savedId: string
+    let nextCases: SavedCase[]
+    let isDuplicate = false
+
+    if (existing) {
+      isDuplicate = true
+      savedId = existing.id
+      nextCases = cases.value.map(c =>
+        c.id === existing.id
+          ? { ...c, currentStep: step, result, savedAt: now }
+          : c
+      )
+    } else {
+      const record: SavedCase = {
+        id: genId(),
+        pattern: pattern.value,
+        testString: testString.value,
+        currentStep: step,
+        result,
+        savedAt: now
+      }
+      savedId = record.id
+      nextCases = [...cases.value, record]
+    }
+
+    // 会话先于列表写入：任一步失败都不改变内存中的编辑内容
+    try {
+      persistSession({ caseId: savedId, savedAt: now })
+      persistCases(nextCases)
+    } catch (e: unknown) {
+      const text = e instanceof Error ? e.message : '保存失败，请检查浏览器存储设置'
+      flash('error', text)
+      return
+    }
+
+    cases.value = nextCases
+    activeCaseId.value = savedId
+    flash(
+      'success',
+      isDuplicate ? '该用例已存在，已更新关注步骤并置顶' : '用例已保存到最近用例'
+    )
+  }
+
+  /**
+   * 删除一条历史用例。
+   * - 不影响当前编辑区内容（正在查看时也仅解除关联高亮标记）
+   * - 若删除的是最后一次会话指向的用例，同步清除会话指针，
+   *   避免旧快照在下次进入时唤起已删除历史
+   */
+  function deleteCase(id: string): void {
+    const target = cases.value.find(c => c.id === id)
+    if (!target) {
+      flash('error', '该用例已不存在，列表已刷新')
+      pruneMissingStorage()
+      return
+    }
+
+    const nextCases = cases.value.filter(c => c.id !== id)
+    try {
+      persistCases(nextCases)
+    } catch (e: unknown) {
+      const text = e instanceof Error ? e.message : '删除失败，请稍后重试'
+      flash('error', text)
+      return
+    }
+
+    cases.value = nextCases
+    if (activeCaseId.value === id) activeCaseId.value = null
+
+    const session = readJSON<SessionSnapshot | null>(SESSION_STORAGE_KEY)
+    if (session && session.caseId === id) {
+      clearSession()
+    }
+    flash('success', '用例已删除，当前编辑内容已保留')
+  }
+
+  /**
+   * 从最近用例按时间重新打开一条用例。
+   * 恢复正则、测试文本、关注步骤、高亮与统计；
+   * 目标已被删除时明确提示并保留当前编辑内容。
+   */
+  function openCase(id: string): void {
+    const target = cases.value.find(c => c.id === id)
+    if (!target) {
+      flash('error', '该用例已被删除，无法打开')
+      pruneMissingStorage()
+      return
+    }
+
+    applySnapshot(target)
+    activeCaseId.value = target.id
+    try {
+      persistSession({ caseId: target.id, savedAt: target.savedAt })
+    } catch {
+      // 用例已成功恢复到工作区，仅会话指针写入失败不阻断使用
+      flash('info', '用例已打开，但浏览器存储不可用，下次进入可能无法恢复')
+      return
+    }
+    flash('success', '已恢复用例')
+  }
+
+  /** 清理存储与会话不一致的状态（损坏数据等） */
+  function pruneMissingStorage() {
+    const valid = loadCases()
+    cases.value = valid
+    const session = readJSON<SessionSnapshot | null>(SESSION_STORAGE_KEY)
+    if (session && !valid.some(c => c.id === session.caseId)) {
+      clearSession()
+    }
+    if (activeCaseId.value && !valid.some(c => c.id === activeCaseId.value)) {
+      activeCaseId.value = null
+    }
+  }
+
+  /**
+   * 启动 / 重新进入工作台时恢复最后一次会话。
+   * 仅当会话指针仍指向历史中存在的用例时才恢复——
+   * 已删除的历史不能被旧快照唤起。
+   */
+  function restoreSession(): boolean {
+    // store 初始化时已执行过恢复：再次调用直接返回当前是否处于已恢复用例上
+    if (hydrated.value) {
+      return activeCaseId.value !== null
+    }
+    hydrated.value = true
+    const validCases = loadCases()
+    cases.value = validCases
+
+    const session = readJSON<SessionSnapshot | null>(SESSION_STORAGE_KEY)
+    if (!session || typeof session.caseId !== 'string') {
+      return false
+    }
+
+    const target = validCases.find(c => c.id === session.caseId)
+    if (!target) {
+      // 旧快照指向的历史已删除：清除悬空指针，不恢复任何内容
+      clearSession()
+      activeCaseId.value = null
+      return false
+    }
+
+    applySnapshot(target)
+    activeCaseId.value = target.id
+    return true
+  }
 
   const matchHighlight = computed(() => {
     if (!matchResult.value || !matchResult.value.matched) return null
@@ -432,13 +705,20 @@ export const useRegexStore = defineStore('regex', () => {
     }
   }
 
+  /** 内容一旦改动即与已保存用例脱钩（用例本身仍保留在历史中） */
+  function detachActiveCase() {
+    activeCaseId.value = null
+  }
+
   function setPattern(p: string) {
     pattern.value = p
+    detachActiveCase()
     execute()
   }
 
   function setTestString(s: string) {
     testString.value = s
+    detachActiveCase()
     execute()
   }
 
@@ -446,6 +726,7 @@ export const useRegexStore = defineStore('regex', () => {
     pattern.value = t.pattern
     testString.value = t.testString
     selectedTemplate.value = t.name
+    detachActiveCase()
     execute()
   }
 
@@ -463,26 +744,38 @@ export const useRegexStore = defineStore('regex', () => {
     currentStep.value = 0
   }
 
+  let playTimer: ReturnType<typeof setInterval> | undefined
+
   function play() {
+    if (isPlaying.value) return
     isPlaying.value = true
-    const interval = setInterval(() => {
+    playTimer = setInterval(() => {
       if (matchResult.value && currentStep.value < matchResult.value.steps.length - 1) {
         currentStep.value++
       } else {
-        isPlaying.value = false
-        clearInterval(interval)
+        stop()
       }
     }, 200)
   }
 
   function stop() {
     isPlaying.value = false
+    if (playTimer) {
+      clearInterval(playTimer)
+      playTimer = undefined
+    }
   }
+
+  // store 创建即尝试恢复最后一次会话（Pinia 在 app.mount 前安装，
+  // 因此组件首次渲染拿到的就是恢复后的高亮、播放位置与统计）
+  restoreSession()
 
   return {
     pattern, testString, currentStep, isPlaying, nfa, matchResult, ast, error,
     selectedTemplate, groupColors, matchHighlight,
+    cases, recentCases, activeCaseId, message, hydrated,
     execute, setPattern, setTestString, applyTemplate,
-    stepForward, stepBackward, resetStep, play, stop
+    stepForward, stepBackward, resetStep, play, stop,
+    saveCase, deleteCase, openCase, restoreSession
   }
 })
