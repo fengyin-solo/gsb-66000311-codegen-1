@@ -1,6 +1,10 @@
 import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
-import type { NFA, MatchResult, MatchStep, RegexTemplate, ASTNode } from '../types'
+import { ref, computed, watch } from 'vue'
+import type { NFA, MatchResult, MatchStep, RegexTemplate, ASTNode, HistoryCase, SaveFeedback } from '../types'
+import {
+  MAX_HISTORY, loadHistory, saveHistory, loadTombstones, saveTombstones,
+  loadSession, saveSession, mergeHistory, findDuplicate, clampStep, genId, formatTime
+} from '../utils/persistence'
 
 const GROUP_COLORS = ['#ef4444', '#f97316', '#eab308', '#22c55e', '#3b82f6', '#8b5cf6', '#ec4899', '#14b8a6']
 
@@ -402,6 +406,11 @@ export const useRegexStore = defineStore('regex', () => {
   const error = ref('')
   const selectedTemplate = ref<string>('')
 
+  // 历史用例与会话恢复状态
+  const history = ref<HistoryCase[]>([])
+  const activeCaseId = ref<string | null>(null)
+  const saveFeedback = ref<SaveFeedback | null>(null)
+
   const groupColors = GROUP_COLORS
 
   const matchHighlight = computed(() => {
@@ -434,11 +443,13 @@ export const useRegexStore = defineStore('regex', () => {
 
   function setPattern(p: string) {
     pattern.value = p
+    activeCaseId.value = null
     execute()
   }
 
   function setTestString(s: string) {
     testString.value = s
+    activeCaseId.value = null
     execute()
   }
 
@@ -446,6 +457,7 @@ export const useRegexStore = defineStore('regex', () => {
     pattern.value = t.pattern
     testString.value = t.testString
     selectedTemplate.value = t.name
+    activeCaseId.value = null
     execute()
   }
 
@@ -479,10 +491,156 @@ export const useRegexStore = defineStore('regex', () => {
     isPlaying.value = false
   }
 
+  // ---------- 历史用例与会话恢复 ----------
+
+  let feedbackTimer: ReturnType<typeof setTimeout> | undefined
+  function setFeedback(type: SaveFeedback['type'], text: string) {
+    saveFeedback.value = { type, text }
+    clearTimeout(feedbackTimer)
+    feedbackTimer = setTimeout(() => { saveFeedback.value = null }, 4000)
+  }
+
+  function persistSession() {
+    saveSession({
+      pattern: pattern.value,
+      testString: testString.value,
+      currentStep: currentStep.value,
+      matchResult: matchResult.value,
+      historySnapshot: history.value,
+      updatedAt: Date.now()
+    })
+  }
+
+  let sessionTimer: ReturnType<typeof setTimeout> | undefined
+  function schedulePersistSession() {
+    clearTimeout(sessionTimer)
+    sessionTimer = setTimeout(persistSession, 300)
+  }
+
+  // 同步恢复：刷新/重新进入时直接还原最后一次会话；
+  // 历史 = 存储历史 ∪ 快照历史，再按墓碑过滤（已删除的用例不会被旧快照唤起）
+  function restoreFromStorage() {
+    const tombstones = loadTombstones()
+    const stored = loadHistory()
+    const session = loadSession()
+    history.value = mergeHistory(stored, session ? session.historySnapshot : [], tombstones)
+    if (!session) return
+    pattern.value = session.pattern
+    testString.value = session.testString
+    const mr = session.matchResult
+    if (mr) {
+      try {
+        const built = buildNFA(session.pattern)
+        nfa.value = computeNFA(built)
+        ast.value = parseAST(session.pattern)
+        matchResult.value = mr
+        currentStep.value = clampStep(session.currentStep, mr.steps.length)
+      } catch {
+        nfa.value = null
+        matchResult.value = null
+        ast.value = null
+      }
+    }
+  }
+
+  /** 保存当前正则、测试文本与关注步骤到最近用例 */
+  function saveCurrentCase(): boolean {
+    if (!pattern.value.trim()) {
+      setFeedback('warn', '正则表达式为空，请输入后再保存')
+      return false
+    }
+    if (error.value) {
+      setFeedback('warn', '当前正则存在解析错误，请先修正再保存')
+      return false
+    }
+    const result = matchResult.value
+    if (!result) {
+      setFeedback('warn', '请先执行匹配，再保存当前用例')
+      return false
+    }
+    const dup = findDuplicate(history.value, pattern.value, testString.value)
+    if (dup) {
+      activeCaseId.value = dup.id
+      setFeedback('warn', `相同用例已于${formatTime(dup.savedAt)}保存，未重复添加`)
+      return false
+    }
+    const c: HistoryCase = {
+      id: genId(),
+      pattern: pattern.value,
+      testString: testString.value,
+      currentStep: currentStep.value,
+      savedAt: Date.now(),
+      matchResult: JSON.parse(JSON.stringify(result))
+    }
+    const next = [c, ...history.value].slice(0, MAX_HISTORY)
+    if (!saveHistory(next)) {
+      // 保存失败：不写内存态、不动编辑内容，仅明确提示
+      setFeedback('error', '保存失败：本地存储不可用或空间不足，当前编辑内容已保留')
+      return false
+    }
+    history.value = next
+    activeCaseId.value = c.id
+    setFeedback('success', `已保存到最近用例（关注步骤 ${c.currentStep}）`)
+    persistSession()
+    return true
+  }
+
+  /** 按 id 重新打开历史用例：恢复正则、测试文本、关注步骤与保存时的统计快照 */
+  function openCase(id: string): boolean {
+    const c = history.value.find(x => x.id === id)
+    if (!c) {
+      setFeedback('error', '该用例已被删除，无法打开')
+      return false
+    }
+    stop()
+    try {
+      const built = buildNFA(c.pattern)
+      const result: MatchResult = c.matchResult
+        ? JSON.parse(JSON.stringify(c.matchResult))
+        : runMatch(built.states, built.startState, c.testString)
+      nfa.value = computeNFA(built)
+      ast.value = parseAST(c.pattern)
+      matchResult.value = result
+      pattern.value = c.pattern
+      testString.value = c.testString
+      currentStep.value = clampStep(c.currentStep, result.steps.length)
+      error.value = ''
+      selectedTemplate.value = ''
+      activeCaseId.value = id
+      persistSession()
+      return true
+    } catch (e: any) {
+      error.value = e.message || '用例恢复失败'
+      nfa.value = null
+      matchResult.value = null
+      ast.value = null
+      setFeedback('error', '用例恢复失败：' + (e.message || '未知错误'))
+      return false
+    }
+  }
+
+  function deleteCase(id: string) {
+    if (!history.value.some(c => c.id === id)) return
+    history.value = history.value.filter(c => c.id !== id)
+    saveHistory(history.value)
+    // 记录墓碑，防止旧会话快照把已删除用例带回来
+    saveTombstones([...loadTombstones(), id])
+    if (activeCaseId.value === id) activeCaseId.value = null
+    persistSession()
+    setFeedback('success', '已删除该用例')
+  }
+
+  // 首次使用时同步恢复（先于组件挂载，保证再次进入时无闪烁）
+  restoreFromStorage()
+  // 编辑内容/播放位置变化后自动持久化会话（防抖）
+  watch([pattern, testString, currentStep, matchResult], schedulePersistSession)
+
   return {
     pattern, testString, currentStep, isPlaying, nfa, matchResult, ast, error,
     selectedTemplate, groupColors, matchHighlight,
+    history, activeCaseId, saveFeedback,
     execute, setPattern, setTestString, applyTemplate,
-    stepForward, stepBackward, resetStep, play, stop
+    stepForward, stepBackward, resetStep, play, stop,
+    saveCurrentCase, openCase, deleteCase
   }
 })

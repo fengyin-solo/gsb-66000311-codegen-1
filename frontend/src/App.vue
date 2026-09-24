@@ -8,6 +8,7 @@
     <div class="flex flex-col lg:flex-row gap-4 p-4">
       <div class="lg:w-1/4 space-y-4">
         <RegexEditor />
+        <HistoryPanel />
         <TemplateLibrary />
       </div>
 
@@ -64,7 +65,9 @@ import RegexEditor from './components/RegexEditor.vue'
 import NfaVisualizer from './components/NfaVisualizer.vue'
 import MatchHighlight from './components/MatchHighlight.vue'
 import TemplateLibrary from './components/TemplateLibrary.vue'
+import HistoryPanel from './components/HistoryPanel.vue'
 
 const store = useRegexStore()
-onMounted(() => store.execute())
+// 会话已从本地快照同步恢复（含统计与播放位置）时无需重新执行，否则首次进入自动执行
+onMounted(() => { if (!store.matchResult) store.execute() })
 </script>

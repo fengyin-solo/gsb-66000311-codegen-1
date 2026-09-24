@@ -55,3 +55,28 @@ export interface ASTNode {
   children?: ASTNode[]
   groupIndex?: number
 }
+
+/** 已保存的测试用例：正则 + 测试文本 + 关注步骤 + 保存时的结果快照 */
+export interface HistoryCase {
+  id: string
+  pattern: string
+  testString: string
+  currentStep: number
+  savedAt: number
+  matchResult: MatchResult | null
+}
+
+/** 会话快照：刷新/重新进入工作台时同步恢复 */
+export interface SessionSnapshot {
+  pattern: string
+  testString: string
+  currentStep: number
+  matchResult: MatchResult | null
+  historySnapshot: HistoryCase[]
+  updatedAt: number
+}
+
+export interface SaveFeedback {
+  type: 'success' | 'warn' | 'error'
+  text: string
+}
